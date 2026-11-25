@@ -152,6 +152,19 @@ fn main() {
 
         println!("cargo:rustc-link-search=native={}", runtime_dir);
         println!("cargo:rustc-link-lib=static=clang_rt.osx");
+
+        // SDL loads libusb by its bare file name, which macOS only looks up
+        // in the run paths. Without libusb, controllers macOS has no driver
+        // for (wired and wireless Xbox 360 ones, among others) are not seen.
+        for run_path in [
+            "@executable_path/../Frameworks",
+            "/opt/homebrew/lib",
+            "/usr/local/lib",
+            "/opt/local/lib",
+        ] {
+            println!("cargo:rustc-link-arg-bins=-rpath");
+            println!("cargo:rustc-link-arg-bins={run_path}");
+        }
     }
 
     volk_build.flag("-flto=thin");
