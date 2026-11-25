@@ -1,0 +1,71 @@
+# Builds an unsigned Windows executable of the multi-local-netplay branch and
+# offers it as a download on the run's page. The steps mirror the build-windows
+# job of build.yml, which only publishes downloads for tagged releases.
+name: Windows netplay build
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: ["multi-local-netplay"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-windows:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          fetch-depth: 0
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          target: x86_64-pc-windows-msvc
+      - name: Set LLVM_VERSION
+        run: |
+          $llvm_version = rustc --version --verbose | Select-String "LLVM version" | ForEach-Object { $_.Line.Split(":")[1].Trim() }
+          echo "LLVM_VERSION=$llvm_version" >> $env:GITHUB_ENV
+      - name: Install LLVM and Clang
+        run: |
+          $version = $env:LLVM_VERSION
+          $asset = "LLVM-$version-win64.msi"
+          $msi = Join-Path $env:RUNNER_TEMP $asset
+          $log = Join-Path $env:RUNNER_TEMP 'llvm-install.log'
+
+          Invoke-WebRequest `
+            -Uri "https://github.com/llvm/llvm-project/releases/download/llvmorg-$version/$asset" `
+            -OutFile $msi
+
+          $installer = Start-Process msiexec.exe -Wait -PassThru -ArgumentList `
+            "/i `"$msi`" /qn /norestart /L*v `"$log`""
+          if ($installer.ExitCode -notin @(0, 3010)) {
+            Get-Content $log -Tail 60
+            throw "LLVM MSI exited with code $($installer.ExitCode)"
+          }
+
+          $bin = Join-Path $env:ProgramFiles 'LLVM\bin'
+          $reported = & "$bin\clang-cl.exe" --version
+          $reported | Write-Host
+          if ($LASTEXITCODE -ne 0 -or
+              ($reported -join "`n") -notmatch "clang version $([regex]::Escape($version))\b") {
+            throw "Expected clang-cl $version in $bin"
+          }
+
+          $bin >> $env:GITHUB_PATH
+          "LIBCLANG_PATH=$bin" >> $env:GITHUB_ENV
+      - name: Build
+        run: |
+          cargo build --release --target=x86_64-pc-windows-msvc
+          mkdir output
+          cp target/x86_64-pc-windows-msvc/release/gopher64.exe output/gopher64-netplay-windows-x86_64.exe
+          cp netplay_sync_compare.py output/
+        env:
+          CC: clang-cl
+          CXX: clang-cl
+      - uses: actions/upload-artifact@v7
+        with:
+          name: gopher64-netplay-windows-x86_64
+          path: output/

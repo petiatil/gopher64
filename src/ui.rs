@@ -177,7 +177,45 @@ pub fn sdl_hints() {
         );
         let app_id = std::ffi::CString::new(APP_ID).unwrap();
         sdl3_sys::everything::SDL_SetHint(sdl3_sys::everything::SDL_HINT_APP_ID, app_id.as_ptr());
+
+        #[cfg(target_os = "macos")]
+        if let Some(library) = find_homebrew_vulkan_library()
+            && let Ok(library) = std::ffi::CString::new(library)
+        {
+            sdl3_sys::everything::SDL_SetHint(
+                sdl3_sys::everything::SDL_HINT_VULKAN_LIBRARY,
+                library.as_ptr(),
+            );
+        }
     }
+}
+
+/// The app bundle ships MoltenVK in its Frameworks folder, where SDL finds it.
+/// A binary run from a build directory has no bundle, so point SDL at the
+/// MoltenVK installed by Homebrew instead of failing to create a window.
+#[cfg(target_os = "macos")]
+fn find_homebrew_vulkan_library() -> Option<String> {
+    if std::env::var_os("SDL_VULKAN_LIBRARY").is_some() {
+        return None;
+    }
+    let exe_path = std::env::current_exe().ok()?;
+    let bundled = exe_path.parent()?.parent()?.join("Frameworks");
+    if bundled.join("libMoltenVK.dylib").exists() || bundled.join("libvulkan.1.dylib").exists() {
+        return None;
+    }
+    // The x86_64 Homebrew lives in /usr/local, the arm64 one in /opt/homebrew.
+    // The Vulkan loader comes first, as in SDL's own search order.
+    let prefixes = if cfg!(target_arch = "aarch64") {
+        ["/opt/homebrew/lib", "/usr/local/lib"]
+    } else {
+        ["/usr/local/lib", "/opt/homebrew/lib"]
+    };
+    let candidates = prefixes.into_iter().flat_map(|prefix| {
+        ["libvulkan.1.dylib", "libMoltenVK.dylib"].map(|library| format!("{prefix}/{library}"))
+    });
+    candidates
+        .into_iter()
+        .find(|path| std::path::Path::new(path).exists())
 }
 
 pub fn sdl_init(flag: sdl3_sys::init::SDL_InitFlags) {

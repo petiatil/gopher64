@@ -158,8 +158,8 @@ pub fn pak_switch_event(device: &mut device::Device) {
         if channel.change_pak != PakType::None {
             //stop rumble if it is on
             if let Some(netplay) = &device.netplay {
-                if netplay.player_number == i {
-                    device::ui::input::set_rumble(&device.ui, 0, 0);
+                if let Some(port) = netplay.local_port(i) {
+                    device::ui::input::set_rumble(&device.ui, port, 0);
                 }
             } else {
                 device::ui::input::set_rumble(&device.ui, i, 0);

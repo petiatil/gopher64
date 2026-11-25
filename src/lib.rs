@@ -31,8 +31,13 @@ pub struct Args {
     pub cheats: Option<String>,
     #[arg(long, value_name = "NETPLAY_SERVER_ADDR", hide = true)]
     pub netplay_server_addr: Option<String>,
-    #[arg(long, value_name = "NETPLAY_PLAYER_NUMBER", hide = true)]
-    pub netplay_player_number: Option<usize>,
+    #[arg(
+        long,
+        value_name = "NETPLAY_PLAYER_NUMBER",
+        value_delimiter = ',',
+        hide = true
+    )]
+    pub netplay_player_number: Vec<usize>,
     #[arg(long, value_name = "NETPLAY_NUMBER_OF_PLAYERS", hide = true)]
     pub netplay_number_of_players: Option<usize>,
     #[arg(long, value_name = "NETPLAY_INPUT_DELAY", hide = true)]
@@ -129,6 +134,27 @@ pub fn run(args: Args, arg_count: usize) -> std::io::Result<()> {
 
     ui::sdl_hints();
 
+    if let Some(number_of_players) = args.netplay_number_of_players
+        && !args.netplay_player_number.is_empty()
+    {
+        let mut local_players = args.netplay_player_number.clone();
+        local_players.sort_unstable();
+        local_players.dedup();
+        if number_of_players > 4 {
+            return Err(Error::other("Netplay supports at most 4 players"));
+        }
+        if local_players.iter().any(|slot| *slot >= number_of_players) {
+            return Err(Error::other(
+                "Netplay player numbers must be lower than the number of players",
+            ));
+        }
+        if local_players.len() >= number_of_players {
+            return Err(Error::other(
+                "At least one netplay player must be on another client",
+            ));
+        }
+    }
+
     if let Some(game) = args.game {
         let file_path = std::path::Path::new(&game).to_path_buf();
         let Some(rom_contents) = device::get_rom_contents(&file_path) else {
@@ -162,6 +188,21 @@ pub fn run(args: Args, arg_count: usize) -> std::io::Result<()> {
         }
 
         let mut device = device::Device::new(true);
+
+        if args.netplay_server_addr.is_some() {
+            let mut local_players = args.netplay_player_number.clone();
+            local_players.sort_unstable();
+            local_players.dedup();
+            // the first local player has always used port 1, whatever its settings
+            let enabled = device.ui.config.input.controller_enabled;
+            if let Some(port) = (1..local_players.len()).find(|port| !enabled[*port]) {
+                return Err(Error::other(format!(
+                    "Controller port {} must be enabled in the controller settings to play {} netplay players on this client",
+                    port + 1,
+                    local_players.len()
+                )));
+            }
+        }
 
         device.ui.config.ui.recent_roms.retain(|x| *x != game);
         device.ui.config.ui.recent_roms.insert(0, game);
@@ -245,13 +286,13 @@ pub fn run(args: Args, arg_count: usize) -> std::io::Result<()> {
         };
 
         let netplay_config = if let Some(server_addr) = args.netplay_server_addr
-            && let Some(player_number) = args.netplay_player_number
+            && !args.netplay_player_number.is_empty()
             && let Some(number_of_players) = args.netplay_number_of_players
             && let Some(input_delay) = args.netplay_input_delay
         {
             Some(netplay::NetplayConfig {
                 server_addr,
-                player_number,
+                local_players: args.netplay_player_number,
                 number_of_players,
                 input_delay,
                 ice_config_path: dirs.cache_dir.join("ice_config.json"),
