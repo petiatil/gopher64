@@ -44,6 +44,31 @@ pub struct Args {
     pub netplay_input_delay: Option<usize>,
     #[arg(
         long,
+        conflicts_with_all = ["netplay_join", "netplay_server_addr"],
+        help = "Host a netplay game that other computers join with --netplay-join"
+    )]
+    pub netplay_host: bool,
+    #[arg(
+        long,
+        value_name = "ADDRESS",
+        conflicts_with = "netplay_server_addr",
+        help = "Join the netplay game hosted on the computer at this address"
+    )]
+    pub netplay_join: Option<String>,
+    #[arg(
+        long,
+        value_name = "COUNT",
+        help = "Used with --netplay-host and --netplay-join: how many people play on this computer (default 1)"
+    )]
+    pub netplay_local_players: Option<usize>,
+    #[arg(
+        long,
+        value_name = "COUNT",
+        help = "Used with --netplay-host: how many people play in total (default: one more than on this computer)"
+    )]
+    pub netplay_total_players: Option<usize>,
+    #[arg(
+        long,
         value_name = "PROFILE_NAME",
         help = "Create a new input profile (keyboard/gamepad mappings)"
     )]
@@ -124,7 +149,51 @@ pub fn create_runtime() -> (tokio::sync::oneshot::Sender<()>, tokio::runtime::Ha
     (close_tx, rx.blocking_recv().unwrap())
 }
 
-pub fn run(args: Args, arg_count: usize) -> std::io::Result<()> {
+/// The port of the connection server that a netplay host runs.
+const DIRECT_NETPLAY_PORT: u16 = 3536;
+const DIRECT_NETPLAY_INPUT_DELAY: usize = 2;
+
+/// Turns what a player types to join a host (an IP address or a name, with or
+/// without a port, or a complete URL) into the URL of its connection server.
+fn netplay_server_url(address: &str) -> String {
+    let address = address.trim().trim_end_matches('/');
+    if address.starts_with("ws://") || address.starts_with("wss://") {
+        return address.to_string();
+    }
+    let has_port = address
+        .rsplit_once(':')
+        .is_some_and(|(host, port)| !host.contains(':') && port.parse::<u16>().is_ok());
+    if has_port {
+        format!("ws://{address}/gopher64")
+    } else {
+        format!("ws://{address}:{DIRECT_NETPLAY_PORT}/gopher64")
+    }
+}
+
+/// Runs the connection server through which the clients of a hosted netplay
+/// game find each other. It only introduces them; the game traffic goes
+/// directly between the clients.
+fn start_netplay_server() -> std::io::Result<()> {
+    let address =
+        std::net::SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, DIRECT_NETPLAY_PORT));
+    let mut server = matchbox_signaling::SignalingServer::full_mesh_builder(address).build();
+    match server.bind() {
+        Ok(_) => {
+            tokio::spawn(async move {
+                if let Err(e) = server.serve().await {
+                    eprintln!("Netplay connection server stopped: {e}");
+                }
+            });
+            Ok(())
+        }
+        // carrying on would connect to whatever holds the port instead
+        Err(e) => Err(Error::other(format!(
+            "Could not host: port {DIRECT_NETPLAY_PORT} is in use, maybe by another copy of the game that is hosting ({e})"
+        ))),
+    }
+}
+
+pub fn run(mut args: Args, arg_count: usize) -> std::io::Result<()> {
     let dirs = ui::get_dirs();
 
     std::fs::create_dir_all(&dirs.config_dir)?;
@@ -155,6 +224,45 @@ pub fn run(args: Args, arg_count: usize) -> std::io::Result<()> {
         }
     }
 
+    // hosting or joining: the player slots are worked out between the clients
+    let auto_role = if args.netplay_host {
+        Some(netplay::AutoRole::Host)
+    } else if args.netplay_join.is_some() {
+        Some(netplay::AutoRole::Join)
+    } else {
+        None
+    };
+    let local_player_count = args.netplay_local_players.unwrap_or(1);
+    if let Some(role) = &auto_role {
+        if !(1..=3).contains(&local_player_count) {
+            return Err(Error::other(
+                "Between 1 and 3 people can play netplay on one computer",
+            ));
+        }
+        if *role == netplay::AutoRole::Host {
+            let total = args.netplay_total_players.unwrap_or(local_player_count + 1);
+            if total > 4 || total <= local_player_count {
+                return Err(Error::other(
+                    "The total number of netplay players must be at most 4 and include at least one player on another computer",
+                ));
+            }
+            args.netplay_server_addr =
+                Some(format!("ws://127.0.0.1:{DIRECT_NETPLAY_PORT}/gopher64"));
+            args.netplay_player_number = (0..local_player_count).collect();
+            args.netplay_number_of_players = Some(total);
+        } else {
+            args.netplay_server_addr = args.netplay_join.as_deref().map(netplay_server_url);
+            // placeholders, the host decides both
+            args.netplay_player_number = (0..local_player_count).collect();
+            args.netplay_number_of_players = Some(0);
+        }
+        args.netplay_input_delay
+            .get_or_insert(DIRECT_NETPLAY_INPUT_DELAY);
+        // these must be the same on every client, so use the defaults
+        args.overclock = Some(false);
+        args.disable_expansion_pak = Some(false);
+    }
+
     if let Some(game) = args.game {
         let file_path = std::path::Path::new(&game).to_path_buf();
         let Some(rom_contents) = device::get_rom_contents(&file_path) else {
@@ -164,7 +272,11 @@ pub fn run(args: Args, arg_count: usize) -> std::io::Result<()> {
             )));
         };
 
-        let cheats = if let Some(cheats_file) = args.cheats {
+        let game_id = ui::storage::get_game_crc(&rom_contents);
+        let cheats = if auto_role.is_some() {
+            // cheats must also be the same on every client
+            Default::default()
+        } else if let Some(cheats_file) = args.cheats {
             if let Ok(data) = std::fs::read(cheats_file)
                 && let Ok(cheats) = serde_json::from_slice(&data)
             {
@@ -173,10 +285,9 @@ pub fn run(args: Args, arg_count: usize) -> std::io::Result<()> {
                 return Err(Error::other("Could not read cheats file"));
             }
         } else {
-            let game_crc = ui::storage::get_game_crc(&rom_contents);
             ui::config::Cheats::new()
                 .cheats
-                .get(&game_crc)
+                .get(&game_id)
                 .cloned()
                 .unwrap_or_default()
         };
@@ -187,12 +298,23 @@ pub fn run(args: Args, arg_count: usize) -> std::io::Result<()> {
             return Err(Error::other("Savestate slot must be between 0 and 9"));
         }
 
+        if args.netplay_host {
+            start_netplay_server()?;
+        }
+
         let mut device = device::Device::new(true);
+        let configured_ports = device.ui.config.input.controller_enabled;
 
         if args.netplay_server_addr.is_some() {
             let mut local_players = args.netplay_player_number.clone();
             local_players.sort_unstable();
             local_players.dedup();
+            if auto_role.is_some() {
+                // the player said how many people play here, so there is no
+                // point in refusing to start over a port that is switched off
+                let enabled = &mut device.ui.config.input.controller_enabled;
+                enabled[..local_player_count].fill(true);
+            }
             // the first local player has always used port 1, whatever its settings
             let enabled = device.ui.config.input.controller_enabled;
             if let Some(port) = (1..local_players.len()).find(|port| !enabled[*port]) {
@@ -296,6 +418,11 @@ pub fn run(args: Args, arg_count: usize) -> std::io::Result<()> {
                 number_of_players,
                 input_delay,
                 ice_config_path: dirs.cache_dir.join("ice_config.json"),
+                auto_slots: auto_role.map(|role| netplay::AutoSlots {
+                    role,
+                    local_player_count,
+                    game_id,
+                }),
             })
         } else {
             None
@@ -313,6 +440,8 @@ pub fn run(args: Args, arg_count: usize) -> std::io::Result<()> {
             ra_config,
             netplay_config,
         );
+        // ports enabled just for a hosted or joined game are not a setting
+        device.ui.config.input.controller_enabled = configured_ports;
 
         // on Android, the client is shut down in the app_window function
         #[cfg(not(target_os = "android"))]
@@ -437,4 +566,33 @@ fn android_main(app: slint::android::AndroidApp) {
     close_tx.send(()).unwrap();
     *android::WEAK_SLINT_WINDOW.lock().unwrap() = None;
     *android::ANDROID_APP.lock().unwrap() = None;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn join_address_becomes_a_server_url() {
+        assert_eq!(
+            netplay_server_url("100.101.254.114"),
+            "ws://100.101.254.114:3536/gopher64"
+        );
+        assert_eq!(
+            netplay_server_url(" my-mac.tailnet.ts.net "),
+            "ws://my-mac.tailnet.ts.net:3536/gopher64"
+        );
+        assert_eq!(
+            netplay_server_url("10.0.0.5:4000"),
+            "ws://10.0.0.5:4000/gopher64"
+        );
+        assert_eq!(
+            netplay_server_url("ws://10.0.0.5:3536/room"),
+            "ws://10.0.0.5:3536/room"
+        );
+        assert_eq!(
+            netplay_server_url("wss://example.com/room/"),
+            "wss://example.com/room"
+        );
+    }
 }

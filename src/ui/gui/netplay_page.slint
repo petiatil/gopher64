@@ -1,7 +1,7 @@
 // Copyright © SixtyFPS GmbH <info@slint.dev>
 // SPDX-License-Identifier: MIT
 
-import { Button } from "std-widgets.slint";
+import { Button, ComboBox, LineEdit } from "std-widgets.slint";
 import { ActionRow, Divider, Page } from "page.slint";
 import { State } from "localgame_page.slint";
 
@@ -21,6 +21,16 @@ export global NetplayData {
     in-out property <bool> show_wait_session;
     in-out property <bool> show_create_session;
     in-out property <bool> show_join_session;
+
+    // direct connection
+    in-out property <string> direct_rom;
+    in-out property <string> direct_rom_name;
+    in-out property <string> direct_host_address;
+    in-out property <string> direct_own_addresses;
+    // index 0 is one player
+    in-out property <int> direct_local_players;
+    // index 0 is two players
+    in-out property <int> direct_total_players;
 }
 
 export component Netplay inherits Page {
@@ -28,6 +38,9 @@ export component Netplay inherits Page {
     callback join_session_button_clicked;
     callback netplay_discord_button_clicked;
     callback netplay_feedback_button_clicked;
+    callback direct_choose_game_clicked;
+    callback direct_host_clicked;
+    callback direct_join_clicked;
     title: @tr("Netplay");
     content-max-width: 440px;
 
@@ -54,6 +67,104 @@ export component Netplay inherits Page {
         }
 
         Divider {}
+
+        if !State.is_android: VerticalLayout {
+            spacing: 10px;
+
+            Text {
+                font-size: 16px;
+                horizontal-alignment: center;
+                text: @tr("Direct Connection");
+            }
+
+            Text {
+                horizontal-alignment: center;
+                wrap: word-wrap;
+                text: @tr("For computers on the same network or the same Tailscale network. One computer hosts the game and the others join it. Everyone needs the same game file.");
+            }
+
+            ActionRow {
+                Text {
+                    vertical-alignment: center;
+                    overflow: elide;
+                    text: NetplayData.direct_rom_name == "" ? @tr("No game chosen") : NetplayData.direct_rom_name;
+                }
+
+                Button {
+                    enabled: !State.game_running;
+                    text: @tr("Choose Game");
+                    clicked => {
+                        direct_choose_game_clicked();
+                    }
+                }
+            }
+
+            ActionRow {
+                Text {
+                    vertical-alignment: center;
+                    text: @tr("Players on this computer:");
+                }
+
+                ComboBox {
+                    model: ["1", "2", "3"];
+                    current-index <=> NetplayData.direct_local_players;
+                    selected => {
+                        // keep room for at least one player on another computer
+                        if NetplayData.direct_total_players < self.current-index {
+                            NetplayData.direct_total_players = self.current-index;
+                        }
+                    }
+                }
+            }
+
+            ActionRow {
+                Text {
+                    vertical-alignment: center;
+                    text: @tr("Players in total:");
+                }
+
+                ComboBox {
+                    model: ["2", "3", "4"];
+                    current-index <=> NetplayData.direct_total_players;
+                }
+
+                Button {
+                    // someone has to play on another computer
+                    enabled: !State.game_running && NetplayData.direct_total_players + 2 > NetplayData.direct_local_players + 1;
+                    text: @tr("Host Game");
+                    clicked => {
+                        direct_host_clicked();
+                    }
+                }
+            }
+
+            if NetplayData.direct_own_addresses != "": Text {
+                horizontal-alignment: center;
+                wrap: word-wrap;
+                text: @tr("When hosting, the others join this address: {}", NetplayData.direct_own_addresses);
+            }
+
+            ActionRow {
+                LineEdit {
+                    min-width: 200px;
+                    placeholder-text: @tr("Address of the host");
+                    text: NetplayData.direct_host_address;
+                    edited(text) => {
+                        NetplayData.direct_host_address = text;
+                    }
+                }
+
+                Button {
+                    enabled: !State.game_running && NetplayData.direct_host_address != "";
+                    text: @tr("Join Game");
+                    clicked => {
+                        direct_join_clicked();
+                    }
+                }
+            }
+        }
+
+        if !State.is_android: Divider {}
 
         ActionRow {
             Button {

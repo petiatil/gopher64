@@ -449,6 +449,12 @@ fn controller_window(app: &AppWindow, config: &ui::config::Config) {
 pub fn save_settings(app: &AppWindow) {
     let mut config = ui::config::Config::new();
     config.ui.rom_dir = app.get_rom_dir().to_string().into();
+    config.ui.direct_netplay = ui::config::DirectNetplay {
+        rom: app.get_netplay_direct_rom().to_string(),
+        host_address: app.get_netplay_direct_host_address().trim().to_string(),
+        local_players: app.get_netplay_direct_local_players() as usize + 1,
+        total_players: app.get_netplay_direct_total_players() as usize + 2,
+    };
     config.video.integer_scaling = app.get_integer_scaling();
     config.video.ssaa = app.get_ssaa();
     config.video.fullscreen = app.get_fullscreen();
@@ -545,6 +551,8 @@ pub fn app_window(
         settings_window(app, &config);
         controller_window(app, &config);
         local_game_window(app, &config);
+        #[cfg(not(target_os = "android"))]
+        direct_netplay_window(app, &config);
     }
     let lobby_tasks = ui::netplay::netplay_window(app, no_intro_map.clone());
     ui::cheats::cheats_window(app, no_intro_map);
@@ -598,17 +606,7 @@ pub fn run_rom(
         weak.upgrade_in_event_loop(move |handle| handle.set_game_running(true))
             .unwrap();
 
-        let cli_path = std::env::current_exe()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join(format!("{}-cli", env!("CARGO_PKG_NAME")));
-        let cmd_path = if cfg!(target_os = "macos") && cli_path.exists() {
-            cli_path
-        } else {
-            std::env::current_exe().unwrap()
-        };
-        let mut command = tokio::process::Command::new(cmd_path);
+        let mut command = tokio::process::Command::new(game_program());
         command.args([
             "--overclock",
             &game_settings.overclock.to_string(),
@@ -634,29 +632,195 @@ pub fn run_rom(
             ]);
         }
 
-        let success = command
-            .arg(file_path.to_str().unwrap())
-            .status()
-            .await
-            .unwrap()
-            .success();
-
-        if !success {
-            eprintln!("Failed to run game");
-        }
+        wait_for_game(command, file_path, weak).await;
 
         let _ = std::fs::remove_file(cheats_path);
+    });
+}
 
+/// Runs the game process with `file_path` and updates the window once it exits.
+#[cfg(not(target_os = "android"))]
+async fn wait_for_game(
+    mut command: tokio::process::Command,
+    file_path: std::path::PathBuf,
+    weak: slint::Weak<AppWindow>,
+) {
+    let success = command
+        .arg(file_path.to_str().unwrap())
+        .status()
+        .await
+        .unwrap()
+        .success();
+
+    if !success {
+        eprintln!("Failed to run game");
+    }
+
+    weak.upgrade_in_event_loop(move |handle| {
+        if let Some(rom_dir) = file_path.parent().unwrap().to_str() {
+            handle.set_rom_dir(rom_dir.into());
+        }
+        if success {
+            update_recent_roms(&handle, file_path);
+        }
+        handle.set_game_running(false);
+    })
+    .unwrap();
+}
+
+/// The program that runs a game: this one, or its command-line twin in the
+/// macOS app bundle.
+#[cfg(not(target_os = "android"))]
+fn game_program() -> std::path::PathBuf {
+    let cli_path = std::env::current_exe()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join(format!("{}-cli", env!("CARGO_PKG_NAME")));
+    if cfg!(target_os = "macos") && cli_path.exists() {
+        cli_path
+    } else {
+        std::env::current_exe().unwrap()
+    }
+}
+
+/// The addresses under which other computers reach this one, for the host to
+/// pass on: the Tailscale one if there is one, and the one on the local network.
+#[cfg(not(target_os = "android"))]
+fn own_addresses() -> String {
+    let mut addresses: Vec<String> = vec![];
+    // No packet is sent: connecting a UDP socket only picks the local address
+    // that would be used to reach the destination. The first destination is
+    // inside the Tailscale range, the second one is on the internet.
+    for destination in ["100.100.100.100:53", "8.8.8.8:53"] {
+        if let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0")
+            && socket.connect(destination).is_ok()
+            && let Ok(std::net::SocketAddr::V4(address)) = socket.local_addr()
+            && !address.ip().is_unspecified()
+            && !address.ip().is_loopback()
+        {
+            let octets = address.ip().octets();
+            let tailscale = octets[0] == 100 && (64..128).contains(&octets[1]);
+            let text = if tailscale {
+                format!("{} (Tailscale)", address.ip())
+            } else {
+                address.ip().to_string()
+            };
+            if !addresses.contains(&text) {
+                addresses.push(text);
+            }
+        }
+    }
+    addresses.join(", ")
+}
+
+#[cfg(not(target_os = "android"))]
+fn set_direct_netplay_rom(app: &AppWindow, path: &std::path::Path) {
+    app.set_netplay_direct_rom(path.to_string_lossy().to_string().into());
+    app.set_netplay_direct_rom_name(
+        path.file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_default()
+            .into(),
+    );
+}
+
+/// Starts a hosted or joined netplay game with the choices made on the netplay
+/// page, asking for the game file first if none was chosen yet.
+#[cfg(not(target_os = "android"))]
+fn run_direct_netplay(app: &AppWindow, host: bool) {
+    if app.get_game_running() {
+        return;
+    }
+    let local_players = app.get_netplay_direct_local_players() + 1;
+    let total_players = app.get_netplay_direct_total_players() + 2;
+    let host_address = app.get_netplay_direct_host_address().trim().to_string();
+    if !host && host_address.is_empty() {
+        return;
+    }
+    let chosen_rom = std::path::PathBuf::from(app.get_netplay_direct_rom().to_string());
+    let select_rom = select_rom(app.get_rom_dir());
+
+    let weak = app.as_weak();
+    tokio::spawn(async move {
+        let file_path = if chosen_rom.is_file() {
+            chosen_rom
+        } else if let Some(file_path) = select_rom.await {
+            file_path
+        } else {
+            return;
+        };
+
+        let rom = file_path.clone();
+        let (saved_tx, saved_rx) = tokio::sync::oneshot::channel();
         weak.upgrade_in_event_loop(move |handle| {
-            if let Some(rom_dir) = file_path.parent().unwrap().to_str() {
-                handle.set_rom_dir(rom_dir.into());
-            }
-            if success {
-                update_recent_roms(&handle, file_path);
-            }
-            handle.set_game_running(false);
+            set_direct_netplay_rom(&handle, &rom);
+            save_settings(&handle);
+            handle.set_game_running(true);
+            let _ = saved_tx.send(());
         })
         .unwrap();
+        // the game process reads the config, so it must be written completely
+        let _ = saved_rx.await;
+
+        let mut command = tokio::process::Command::new(game_program());
+        if host {
+            command.args(["--netplay-host", "--netplay-total-players"]);
+            command.arg(total_players.to_string());
+        } else {
+            command.args(["--netplay-join", &host_address]);
+        }
+        command.args(["--netplay-local-players", &local_players.to_string()]);
+        wait_for_game(command, file_path, weak).await;
+    });
+}
+
+#[cfg(not(target_os = "android"))]
+fn direct_netplay_window(app: &AppWindow, config: &ui::config::Config) {
+    let direct = &config.ui.direct_netplay;
+    if !direct.rom.is_empty() && std::path::Path::new(&direct.rom).is_file() {
+        set_direct_netplay_rom(app, std::path::Path::new(&direct.rom));
+    }
+    app.set_netplay_direct_host_address(direct.host_address.clone().into());
+    let local_players = direct.local_players.clamp(1, 3);
+    let total_players = if direct.total_players == 0 {
+        local_players + 1
+    } else {
+        direct.total_players.clamp(2, 4)
+    };
+    app.set_netplay_direct_local_players(local_players as i32 - 1);
+    app.set_netplay_direct_total_players(total_players as i32 - 2);
+    app.set_netplay_direct_own_addresses(own_addresses().into());
+
+    let weak = app.as_weak();
+    app.on_netplay_direct_choose_game(move || {
+        let Some(handle) = weak.upgrade() else {
+            return;
+        };
+        let select_rom = select_rom(handle.get_rom_dir());
+        let weak = weak.clone();
+        tokio::spawn(async move {
+            if let Some(file_path) = select_rom.await {
+                weak.upgrade_in_event_loop(move |handle| {
+                    set_direct_netplay_rom(&handle, &file_path);
+                })
+                .unwrap();
+            }
+        });
+    });
+
+    let weak = app.as_weak();
+    app.on_netplay_direct_host(move || {
+        if let Some(handle) = weak.upgrade() {
+            run_direct_netplay(&handle, true);
+        }
+    });
+
+    let weak = app.as_weak();
+    app.on_netplay_direct_join(move || {
+        if let Some(handle) = weak.upgrade() {
+            run_direct_netplay(&handle, false);
+        }
     });
 }
 

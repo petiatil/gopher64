@@ -76,6 +76,19 @@ pub struct Ui {
     pub theme: i32,
     pub rom_dir: std::path::PathBuf,
     pub recent_roms: Vec<String>,
+    /// What was last used on the direct connection part of the netplay page.
+    #[serde(default)]
+    pub direct_netplay: DirectNetplay,
+}
+
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+pub struct DirectNetplay {
+    pub rom: String,
+    pub host_address: String,
+    /// 0 stands for the default of one player.
+    pub local_players: usize,
+    /// 0 stands for the default of one more than `local_players`.
+    pub total_players: usize,
 }
 
 #[derive(Default, serde::Serialize, serde::Deserialize)]
@@ -201,6 +214,7 @@ impl Config {
                 theme: 0,
                 rom_dir: std::path::PathBuf::new(),
                 recent_roms: Vec::new(),
+                direct_netplay: DirectNetplay::default(),
             },
             write_to_disk: true,
         }

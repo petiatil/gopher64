@@ -51,6 +51,27 @@ pub struct NetplayConfig {
     pub number_of_players: usize,
     pub input_delay: usize,
     pub ice_config_path: std::path::PathBuf,
+    /// Set when the player slots are handed out by the host instead of being
+    /// chosen on every client.
+    pub auto_slots: Option<AutoSlots>,
+}
+
+pub struct AutoSlots {
+    pub role: AutoRole,
+    /// How many people play on this client.
+    pub local_player_count: usize,
+    /// Identifies the game, so that clients running different ROMs do not start.
+    pub game_id: String,
+}
+
+#[derive(PartialEq)]
+pub enum AutoRole {
+    /// Plays the first slots (`local_players` and `number_of_players` are set)
+    /// and hands the others out.
+    Host,
+    /// Asks the host for slots (`local_players` and `number_of_players` are
+    /// only known once it answers).
+    Join,
 }
 
 pub struct Netplay {
@@ -270,6 +291,14 @@ fn encode_player_numbers(local_players: &[usize]) -> Vec<u8> {
 
 // Works out which peer plays which slots. A peer can play several slots, so
 // the number of peers is not known in advance.
+fn decode_player_numbers(data: &[u8]) -> Vec<usize> {
+    data.as_chunks::<8>()
+        .0
+        .iter()
+        .map(|slot| u64::from_be_bytes(*slot) as usize)
+        .collect()
+}
+
 struct Handshake<P> {
     number_of_players: usize,
     // slot -> owner, from either message. `None` is a slot played on this client.
@@ -303,12 +332,14 @@ impl<P: Copy + PartialEq> Handshake<P> {
         if name != MESSAGE_PLAYER_SLOTS && name != MESSAGE_PLAYER_NUMBER {
             return;
         }
-        let slots: Vec<usize> = data
-            .as_chunks::<8>()
-            .0
-            .iter()
-            .map(|slot| u64::from_be_bytes(*slot) as usize)
-            .collect();
+        let slots = decode_player_numbers(data);
+        // A peer only holds what its latest message asks for. Slots it asked
+        // for earlier are free again, also when this message is refused: with
+        // slots handed out by a host, a client can be given different ones.
+        self.known
+            .retain(|slot, owner| *owner != Some(peer) || slots.contains(slot));
+        self.confirmed
+            .retain(|slot, owner| *owner != Some(peer) || slots.contains(slot));
         // a slot is free for this peer unless it is out of range, played here,
         // or held by another peer that is still connected
         let allowed = slots.iter().all(|slot| match self.known.get(slot) {
@@ -363,32 +394,133 @@ impl<P: Copy + PartialEq> Handshake<P> {
     }
 }
 
+// asks the host for slots: the number of local players, then the game id
+const MESSAGE_AUTO_JOIN: &str = "auto_join";
+// the host's answer: the number of players in the session, then the slots given
+const MESSAGE_AUTO_SLOTS: &str = "auto_slots";
+// the host's other answer: one of the REFUSED_ codes
+const MESSAGE_AUTO_REFUSED: &str = "auto_refused";
+const REFUSED_DIFFERENT_GAME: u8 = 1;
+const REFUSED_FULL: u8 = 2;
+
+fn encode_auto_join(local_player_count: usize, game_id: &str) -> Vec<u8> {
+    let mut data = (local_player_count as u64).to_be_bytes().to_vec();
+    data.extend_from_slice(game_id.as_bytes());
+    data
+}
+
+fn encode_auto_slots(number_of_players: usize, slots: &[usize]) -> Vec<u8> {
+    let mut data = (number_of_players as u64).to_be_bytes().to_vec();
+    data.extend(encode_player_numbers(slots));
+    data
+}
+
+/// What a joining client accepts as its slots: the number of players in the
+/// session and exactly `local_player_count` valid slots. Anything else is ignored.
+fn decode_auto_slots(data: &[u8], local_player_count: usize) -> Option<(usize, Vec<usize>)> {
+    let mut numbers = data
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|number| u64::from_be_bytes(*number) as usize);
+    let number_of_players = numbers.next()?;
+    let slots: Vec<usize> = numbers.collect();
+    let valid = number_of_players <= 4
+        && slots.len() == local_player_count
+        && slots.len() < number_of_players
+        && slots.iter().all(|slot| *slot < number_of_players)
+        && slots.windows(2).all(|pair| pair[0] < pair[1]);
+    valid.then_some((number_of_players, slots))
+}
+
+enum AutoReply {
+    Slots(Vec<usize>),
+    Refused(u8),
+}
+
+/// The host's side of handing out slots: it plays the first ones itself and
+/// gives every client that asks the lowest free ones.
+struct SlotAssigner<P> {
+    number_of_players: usize,
+    local_player_count: usize,
+    game_id: String,
+    assigned: Vec<(P, Vec<usize>)>,
+}
+
+impl<P: Copy + PartialEq> SlotAssigner<P> {
+    fn new(number_of_players: usize, local_player_count: usize, game_id: &str) -> Self {
+        Self {
+            number_of_players,
+            local_player_count,
+            game_id: game_id.to_string(),
+            assigned: vec![],
+        }
+    }
+
+    /// Whether `slots` is what `peer` was given. The host ignores every other
+    /// claim, such as one a client still sends for slots it had before.
+    fn gave(&self, peer: P, slots: &[usize]) -> bool {
+        self.assigned
+            .iter()
+            .any(|(owner, given)| *owner == peer && given == slots)
+    }
+
+    /// Answers an `auto_join` message. A client keeps the slots it was given
+    /// for as long as it stays connected and asks for the same number of them.
+    fn request(&mut self, peer: P, data: &[u8], connected: &[P]) -> Option<AutoReply> {
+        let (count, game_id) = data.split_first_chunk::<8>()?;
+        let count = u64::from_be_bytes(*count) as usize;
+
+        // the slots of a client that left are free again
+        self.assigned.retain(|(owner, _)| connected.contains(owner));
+
+        if game_id != self.game_id.as_bytes() {
+            self.assigned.retain(|(owner, _)| *owner != peer);
+            return Some(AutoReply::Refused(REFUSED_DIFFERENT_GAME));
+        }
+        if let Some((_, slots)) = self.assigned.iter().find(|(owner, _)| *owner == peer)
+            && slots.len() == count
+        {
+            return Some(AutoReply::Slots(slots.clone()));
+        }
+        self.assigned.retain(|(owner, _)| *owner != peer);
+
+        let free: Vec<usize> = (self.local_player_count..self.number_of_players)
+            .filter(|slot| !self.assigned.iter().any(|(_, slots)| slots.contains(slot)))
+            .take(count)
+            .collect();
+        if count == 0 || free.len() < count {
+            return Some(AutoReply::Refused(REFUSED_FULL));
+        }
+        self.assigned.push((peer, free.clone()));
+        Some(AutoReply::Slots(free))
+    }
+}
+
 fn send_handshake_message(
     channel: &mut matchbox_socket::WebRtcChannel,
     peers: &[matchbox_socket::PeerId],
     name: &str,
     local_players: &[usize],
 ) {
+    send_raw_message(channel, peers, name, encode_player_numbers(local_players));
+}
+
+fn send_raw_message(
+    channel: &mut matchbox_socket::WebRtcChannel,
+    peers: &[matchbox_socket::PeerId],
+    name: &str,
+    data: Vec<u8>,
+) {
     let message = NetplayMessage {
         name: name.to_string(),
-        data: encode_player_numbers(local_players),
+        data,
     };
     let data = postcard::to_stdvec(&message).unwrap();
     for peer in peers {
         if let Err(e) = channel.try_send(data.clone().into(), *peer) {
             eprintln!("Failed to send message: {}", e);
         }
-    }
-}
-
-fn receive_handshake_messages(
-    channel: &mut matchbox_socket::WebRtcChannel,
-    handshake: &mut Handshake<matchbox_socket::PeerId>,
-    connected: &[matchbox_socket::PeerId],
-) {
-    for (peer, data) in channel.receive() {
-        let message = postcard::from_bytes::<NetplayMessage>(&data).unwrap();
-        handshake.receive(peer, &message.name, &message.data, connected);
     }
 }
 
@@ -630,7 +762,19 @@ pub fn init(
     let mut local_players = netplay_config.local_players.clone();
     local_players.sort_unstable();
     local_players.dedup();
-    let mut handshake = Handshake::new(&local_players, netplay_config.number_of_players);
+    let mut number_of_players = netplay_config.number_of_players;
+    let auto_slots = netplay_config.auto_slots.as_ref();
+    let joining = auto_slots.filter(|auto| auto.role == AutoRole::Join);
+    // a joining client only knows its slots once the host has answered
+    let mut handshake = joining
+        .is_none()
+        .then(|| Handshake::new(&local_players, number_of_players));
+    let mut assigner = auto_slots
+        .filter(|auto| auto.role == AutoRole::Host)
+        .map(|auto| SlotAssigner::new(number_of_players, auto.local_player_count, &auto.game_id));
+    let mut refused: Option<u8> = None;
+    // the peer whose `auto_slots` this joining client follows
+    let mut assigned_by: Option<matchbox_socket::PeerId> = None;
 
     ui::video::onscreen_message(
         "Connecting to netplay peers...\nPlease wait...",
@@ -639,51 +783,145 @@ pub fn init(
 
     device.cpu.running = true;
     while device.cpu.running {
-        if socket
-            .update_peers()
-            .iter()
-            .any(|(_, peer_state)| *peer_state == matchbox_socket::PeerState::Disconnected)
-        {
-            // if someone has disconnected, reset the timeout
-            now = std::time::Instant::now();
+        match socket.try_update_peers() {
+            Ok(changes) => {
+                if changes
+                    .iter()
+                    .any(|(_, peer_state)| *peer_state == matchbox_socket::PeerState::Disconnected)
+                {
+                    // if someone has disconnected, reset the timeout
+                    now = std::time::Instant::now();
+                }
+            }
+            Err(_) => {
+                // The socket gave up on the connection server. That is normal
+                // when joining a host that is not running yet, or that has
+                // left: keep trying until the player closes the window.
+                if let Some(handshake) = handshake.as_mut() {
+                    handshake.reset();
+                }
+                socket = create_socket(builder.clone());
+                now = std::time::Instant::now();
+            }
         }
 
         let connected_peers = socket
             .connected_peers()
             .collect::<Vec<matchbox_socket::PeerId>>();
 
-        receive_handshake_messages(socket.channel_mut(1), &mut handshake, &connected_peers);
-        send_handshake_message(
-            socket.channel_mut(1),
-            &connected_peers,
-            MESSAGE_PLAYER_SLOTS,
-            &local_players,
-        );
-        if handshake.fully_connected(&connected_peers) {
+        if joining.is_some() && assigned_by.is_some_and(|host| !connected_peers.contains(&host)) {
+            // the host that gave out the slots is gone, and with it the slots
+            assigned_by = None;
+            handshake = None;
+        }
+
+        for (peer, data) in socket.channel_mut(1).receive() {
+            let Ok(message) = postcard::from_bytes::<NetplayMessage>(&data) else {
+                continue;
+            };
+            match message.name.as_str() {
+                MESSAGE_AUTO_JOIN => {
+                    if let Some(assigner) = assigner.as_mut()
+                        && let Some(reply) = assigner.request(peer, &message.data, &connected_peers)
+                    {
+                        let (name, data) = match reply {
+                            AutoReply::Slots(slots) => (
+                                MESSAGE_AUTO_SLOTS,
+                                encode_auto_slots(number_of_players, &slots),
+                            ),
+                            AutoReply::Refused(code) => (MESSAGE_AUTO_REFUSED, vec![code]),
+                        };
+                        send_raw_message(socket.channel_mut(1), &[peer], name, data);
+                    }
+                }
+                MESSAGE_AUTO_SLOTS => {
+                    if let Some(auto) = joining
+                        && let Some((total, slots)) =
+                            decode_auto_slots(&message.data, auto.local_player_count)
+                    {
+                        refused = None;
+                        assigned_by = Some(peer);
+                        if handshake.is_none()
+                            || total != number_of_players
+                            || slots != local_players
+                        {
+                            number_of_players = total;
+                            local_players = slots;
+                            handshake = Some(Handshake::new(&local_players, number_of_players));
+                        }
+                    }
+                }
+                MESSAGE_AUTO_REFUSED => {
+                    if joining.is_some() {
+                        refused = message.data.first().copied();
+                    }
+                }
+                _ => {
+                    let given = assigner.as_ref().is_none_or(|assigner| {
+                        assigner.gave(peer, &decode_player_numbers(&message.data))
+                    });
+                    if given && let Some(handshake) = handshake.as_mut() {
+                        handshake.receive(peer, &message.name, &message.data, &connected_peers);
+                    }
+                }
+            }
+        }
+
+        if let Some(auto) = joining {
+            // repeated like the other handshake messages: the host may only
+            // start listening later, and forgets clients that reconnect
+            send_raw_message(
+                socket.channel_mut(1),
+                &connected_peers,
+                MESSAGE_AUTO_JOIN,
+                encode_auto_join(auto.local_player_count, &auto.game_id),
+            );
+        }
+
+        let mut fully_connected = false;
+        if let Some(handshake) = handshake.as_ref() {
             send_handshake_message(
                 socket.channel_mut(1),
                 &connected_peers,
-                MESSAGE_PLAYER_NUMBER,
+                MESSAGE_PLAYER_SLOTS,
                 &local_players,
             );
-            if handshake.complete(&connected_peers) {
-                break;
+            fully_connected = handshake.fully_connected(&connected_peers);
+            if fully_connected {
+                send_handshake_message(
+                    socket.channel_mut(1),
+                    &connected_peers,
+                    MESSAGE_PLAYER_NUMBER,
+                    &local_players,
+                );
+                if handshake.complete(&connected_peers) {
+                    break;
+                }
             }
-        } else if now.elapsed() > socket_timeout {
+        }
+        if !fully_connected && now.elapsed() > socket_timeout {
             socket.close();
-            handshake.reset();
+            if let Some(handshake) = handshake.as_mut() {
+                handshake.reset();
+            }
             socket = create_socket(builder.clone());
             now = std::time::Instant::now();
         }
 
         if message_timer.elapsed() > std::time::Duration::from_secs(4) {
-            let message = if handshake.conflict(&connected_peers) {
-                "Netplay player numbers conflict between clients".to_string()
-            } else {
-                format!(
+            let message = match (refused, handshake.as_ref()) {
+                (Some(REFUSED_DIFFERENT_GAME), _) => {
+                    "The netplay host is running a different game".to_string()
+                }
+                (Some(_), _) => "The netplay session has no room for this client".to_string(),
+                (None, None) => "Waiting for the netplay host...\nPlease wait...".to_string(),
+                (None, Some(handshake)) if handshake.conflict(&connected_peers) => {
+                    "Netplay player numbers conflict between clients".to_string()
+                }
+                (None, Some(handshake)) => format!(
                     "Still waiting for {} netplay player(s)...\nPlease wait...",
                     handshake.missing_players()
-                )
+                ),
             };
             ui::video::onscreen_message(&message, ui::video::MESSAGE_LENGTH_MESSAGE_SHORT);
             message_timer = std::time::Instant::now();
@@ -699,9 +937,11 @@ pub fn init(
         return None;
     }
     device.cpu.running = false;
+    // the loop above only ends with a complete handshake
+    let handshake = handshake?;
 
     let mut session_builder = ggrs::SessionBuilder::<GgrsConfig>::new()
-        .with_num_players(netplay_config.number_of_players)
+        .with_num_players(number_of_players)
         .unwrap()
         .with_input_delay(netplay_config.input_delay)
         .with_sparse_saving_mode(true)
@@ -766,12 +1006,12 @@ pub fn init(
         peers,
         local_players,
         connected: [
-            netplay_config.number_of_players > 0,
-            netplay_config.number_of_players > 1,
-            netplay_config.number_of_players > 2,
-            netplay_config.number_of_players > 3,
+            number_of_players > 0,
+            number_of_players > 1,
+            number_of_players > 2,
+            number_of_players > 3,
         ],
-        inputs: vec![ui::input::InputData::default(); netplay_config.number_of_players],
+        inputs: vec![ui::input::InputData::default(); number_of_players],
         requests: std::collections::VecDeque::new(),
         frame_progress: FrameProgress::default(),
         received_data: std::collections::VecDeque::new(),
@@ -807,6 +1047,166 @@ pub fn close(netplay: &mut Netplay) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn join(count: usize, game: &str) -> Vec<u8> {
+        encode_auto_join(count, game)
+    }
+
+    fn slots_of(reply: Option<AutoReply>) -> Option<Vec<usize>> {
+        match reply {
+            Some(AutoReply::Slots(slots)) => Some(slots),
+            _ => None,
+        }
+    }
+
+    fn refusal_of(reply: Option<AutoReply>) -> Option<u8> {
+        match reply {
+            Some(AutoReply::Refused(code)) => Some(code),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn host_hands_out_the_slots_after_its_own() {
+        // the host plays two of three: one slot is left
+        let mut assigner = SlotAssigner::<u8>::new(3, 2, "game");
+        assert_eq!(
+            slots_of(assigner.request(1, &join(1, "game"), &[1])),
+            Some(vec![2])
+        );
+        // asking again gives the same answer
+        assert_eq!(
+            slots_of(assigner.request(1, &join(1, "game"), &[1])),
+            Some(vec![2])
+        );
+        // and nobody else fits
+        assert_eq!(
+            refusal_of(assigner.request(2, &join(1, "game"), &[1, 2])),
+            Some(REFUSED_FULL)
+        );
+    }
+
+    #[test]
+    fn joiners_share_the_remaining_slots() {
+        let mut assigner = SlotAssigner::<u8>::new(4, 1, "game");
+        assert_eq!(
+            slots_of(assigner.request(1, &join(2, "game"), &[1, 2])),
+            Some(vec![1, 2])
+        );
+        assert_eq!(
+            slots_of(assigner.request(2, &join(1, "game"), &[1, 2])),
+            Some(vec![3])
+        );
+        // a client that changes its mind gets new slots, if they fit
+        assert_eq!(
+            refusal_of(assigner.request(2, &join(2, "game"), &[1, 2])),
+            Some(REFUSED_FULL)
+        );
+    }
+
+    #[test]
+    fn reconnecting_joiner_gets_its_slots_back() {
+        let mut assigner = SlotAssigner::<u8>::new(3, 1, "game");
+        assert_eq!(
+            slots_of(assigner.request(1, &join(2, "game"), &[1])),
+            Some(vec![1, 2])
+        );
+        // same client under a new id, the old one is gone
+        assert_eq!(
+            slots_of(assigner.request(9, &join(2, "game"), &[9])),
+            Some(vec![1, 2])
+        );
+        // but not while the old id is still connected
+        let mut assigner = SlotAssigner::<u8>::new(3, 1, "game");
+        assigner.request(1, &join(2, "game"), &[1]);
+        assert_eq!(
+            refusal_of(assigner.request(9, &join(2, "game"), &[1, 9])),
+            Some(REFUSED_FULL)
+        );
+    }
+
+    #[test]
+    fn different_game_or_bad_request_is_refused() {
+        let mut assigner = SlotAssigner::<u8>::new(3, 1, "game");
+        assert_eq!(
+            refusal_of(assigner.request(1, &join(1, "other"), &[1])),
+            Some(REFUSED_DIFFERENT_GAME)
+        );
+        assert_eq!(
+            refusal_of(assigner.request(1, &join(0, "game"), &[1])),
+            Some(REFUSED_FULL)
+        );
+        assert_eq!(
+            refusal_of(assigner.request(1, &join(3, "game"), &[1])),
+            Some(REFUSED_FULL)
+        );
+        // too short to be a request at all
+        assert!(assigner.request(1, &[0; 4], &[1]).is_none());
+        // none of this used up a slot
+        assert_eq!(
+            slots_of(assigner.request(1, &join(2, "game"), &[1])),
+            Some(vec![1, 2])
+        );
+    }
+
+    #[test]
+    fn joiner_only_accepts_slots_that_make_sense() {
+        assert_eq!(
+            decode_auto_slots(&encode_auto_slots(3, &[2]), 1),
+            Some((3, vec![2]))
+        );
+        assert_eq!(
+            decode_auto_slots(&encode_auto_slots(4, &[1, 2]), 2),
+            Some((4, vec![1, 2]))
+        );
+        // not the number of slots that was asked for
+        assert_eq!(decode_auto_slots(&encode_auto_slots(3, &[1, 2]), 1), None);
+        // out of range, duplicated, too many players, or nobody else left
+        assert_eq!(decode_auto_slots(&encode_auto_slots(3, &[3]), 1), None);
+        assert_eq!(decode_auto_slots(&encode_auto_slots(4, &[2, 2]), 2), None);
+        assert_eq!(decode_auto_slots(&encode_auto_slots(5, &[4]), 1), None);
+        assert_eq!(decode_auto_slots(&encode_auto_slots(1, &[0]), 1), None);
+        assert_eq!(decode_auto_slots(&[], 1), None);
+    }
+
+    #[test]
+    fn a_peer_only_holds_its_latest_claim() {
+        // B and C swap slots after the host handed them out again
+        let mut host = Handshake::<u8>::new(&[0], 3);
+        deliver(&mut host, 2, MESSAGE_PLAYER_NUMBER, &[1], &[2, 3]);
+        deliver(&mut host, 3, MESSAGE_PLAYER_NUMBER, &[2], &[2, 3]);
+        assert!(host.complete(&[2, 3]));
+        // the first new claim is refused, but frees the slot it held
+        deliver(&mut host, 2, MESSAGE_PLAYER_NUMBER, &[2], &[2, 3]);
+        assert!(host.conflict(&[2, 3]) && !host.complete(&[2, 3]));
+        deliver(&mut host, 3, MESSAGE_PLAYER_NUMBER, &[1], &[2, 3]);
+        deliver(&mut host, 2, MESSAGE_PLAYER_NUMBER, &[2], &[2, 3]);
+        assert!(!host.conflict(&[2, 3]) && host.complete(&[2, 3]));
+    }
+
+    #[test]
+    fn host_knows_which_claims_it_gave_out() {
+        let mut assigner = SlotAssigner::<u8>::new(3, 1, "game");
+        assigner.request(5, &join(2, "game"), &[5]);
+        assert!(assigner.gave(5, &[1, 2]));
+        assert!(!assigner.gave(5, &[1]));
+        assert!(!assigner.gave(6, &[1, 2]));
+    }
+
+    #[test]
+    fn host_and_joiner_agree_end_to_end() {
+        // PC hosts two of three players, the Mac joins with one
+        let mut assigner = SlotAssigner::<u8>::new(3, 2, "game");
+        let reply = slots_of(assigner.request(2, &join(1, "game"), &[2])).unwrap();
+        let (total, mac_slots) = decode_auto_slots(&encode_auto_slots(3, &reply), 1).unwrap();
+        let mut pc = Handshake::<u8>::new(&[0, 1], 3);
+        let mut mac = Handshake::<u8>::new(&mac_slots, total);
+        deliver(&mut pc, 2, MESSAGE_PLAYER_SLOTS, &mac_slots, &[2]);
+        deliver(&mut mac, 1, MESSAGE_PLAYER_SLOTS, &[0, 1], &[1]);
+        deliver(&mut pc, 2, MESSAGE_PLAYER_NUMBER, &mac_slots, &[2]);
+        deliver(&mut mac, 1, MESSAGE_PLAYER_NUMBER, &[0, 1], &[1]);
+        assert!(pc.complete(&[2]) && mac.complete(&[1]));
+    }
 
     #[test]
     fn sync_log_line_locates_a_difference() {

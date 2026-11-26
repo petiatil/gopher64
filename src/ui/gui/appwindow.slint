@@ -54,6 +54,9 @@ export component AppWindow inherits Window {
     callback netplay_select_rom(string);
     callback netplay_join_session(string, string, string, string);
     callback netplay_close;
+    callback netplay_direct_choose_game;
+    callback netplay_direct_host;
+    callback netplay_direct_join;
     callback cheats_select_rom_clicked(string);
     callback cheats_clear_clicked;
     callback cheat_toggled(string, string, string, bool);
@@ -116,6 +119,12 @@ export component AppWindow inherits Window {
     in-out property show_netplay_create_session <=> NetplayData.show_create_session;
     in-out property show_netplay_join_session <=> NetplayData.show_join_session;
 
+    in-out property netplay_direct_rom <=> NetplayData.direct_rom;
+    in-out property netplay_direct_rom_name <=> NetplayData.direct_rom_name;
+    in-out property netplay_direct_host_address <=> NetplayData.direct_host_address;
+    in-out property netplay_direct_own_addresses <=> NetplayData.direct_own_addresses;
+    in-out property netplay_direct_local_players <=> NetplayData.direct_local_players;
+    in-out property netplay_direct_total_players <=> NetplayData.direct_total_players;
     in-out property netplay_game_name <=> NetplayData.game_name;
     in-out property netplay_game_hash <=> NetplayData.game_hash;
     in-out property netplay_game_cheats <=> NetplayData.game_cheats;
@@ -265,6 +274,15 @@ export component AppWindow inherits Window {
             }
             netplay_feedback_button_clicked => {
                 netplay_feedback_button_clicked();
+            }
+            direct_choose_game_clicked => {
+                netplay_direct_choose_game();
+            }
+            direct_host_clicked => {
+                netplay_direct_host();
+            }
+            direct_join_clicked => {
+                netplay_direct_join();
             }
         }
         if(side-bar.current-item == 2 && show_netplay_wait_session): NetplayWait {
