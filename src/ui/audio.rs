@@ -128,7 +128,7 @@ pub fn play_audio(device: &mut device::Device, dram_addr: usize, length: u64) {
         return;
     }
 
-    if netplay::replaying_audio(device.netplay.as_ref()) {
+    if netplay::in_rollback(device.netplay.as_ref()) {
         return;
     }
 
@@ -152,10 +152,20 @@ pub fn play_audio(device: &mut device::Device, dram_addr: usize, length: u64) {
         device.ai.freq,
         device.vi.frame_time,
         device.ui.speed_limiter.enabled,
+        device
+            .netplay
+            .as_ref()
+            .map_or(1.0, netplay::Netplay::audio_rate),
     );
 }
 
-fn queue_audio(audio: &mut ui::Audio, frequency: u64, frame_time: f64, speed_limited: bool) {
+fn queue_audio(
+    audio: &mut ui::Audio,
+    frequency: u64,
+    frame_time: f64,
+    speed_limited: bool,
+    playback_rate: f64,
+) {
     let bytes_per_second = frequency as f64 * BYTES_PER_FRAME as f64;
     let bytes_per_video_frame = bytes_per_second * frame_time;
     if bytes_per_video_frame <= 0.0 || audio.primary_buffer.is_empty() {
@@ -224,7 +234,12 @@ fn queue_audio(audio: &mut ui::Audio, frequency: u64, frame_time: f64, speed_lim
                 1.0
             };
             audio.frequency_ratio = ratio;
-            sdl3_sys::audio::SDL_SetAudioStreamFrequencyRatio(stream, ratio as f32);
+            // Follow the paced VI immediately. The queue servo only trims
+            // residual device clock drift around that playback rate.
+            sdl3_sys::audio::SDL_SetAudioStreamFrequencyRatio(
+                stream,
+                (playback_rate * ratio) as f32,
+            );
             sdl3_sys::audio::SDL_PutAudioStreamData(
                 stream,
                 audio.primary_buffer.as_ptr().cast(),

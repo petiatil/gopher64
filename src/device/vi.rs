@@ -120,7 +120,8 @@ pub fn write_regs(device: &mut device::Device, address: u64, value: u32, mask: u
 }
 
 pub fn update_screen(device: &mut device::Device) {
-    if !netplay::in_rollback(device.netplay.as_ref()) {
+    let present = !netplay::in_rollback(device.netplay.as_ref());
+    if present {
         ui::video::render_frame();
     }
 
@@ -130,18 +131,18 @@ pub fn update_screen(device: &mut device::Device) {
         reset_pace_deadline(device);
     }
 
-    if !netplay::in_rollback(device.netplay.as_ref())
-        && device
-            .ui
-            .speed_limiter
-            .frame_counter
-            .is_multiple_of(device.ui.speed_limiter.limit_freq)
-        && device.ui.speed_limiter.enabled
-    {
-        speed_limiter(device);
-    }
-
-    if !netplay::in_rollback(device.netplay.as_ref()) {
+    if present {
+        if let Some(netplay) = device.netplay.as_mut() {
+            netplay.pace_frame(device.vi.frame_time);
+        } else if device.ui.speed_limiter.enabled
+            && device
+                .ui
+                .speed_limiter
+                .frame_counter
+                .is_multiple_of(device.ui.speed_limiter.limit_freq)
+        {
+            speed_limiter(device);
+        }
         ui::video::update_screen();
         device.ui.speed_limiter.frame_counter += 1;
         let _ = device.ui.video.vis_tx.as_ref().unwrap().send(true);
@@ -208,18 +209,9 @@ pub fn init(device: &mut device::Device) {
 
 fn speed_limiter(device: &mut device::Device) {
     let mut speed_limiter_toggled = false;
-    let mut interval = std::time::Duration::from_secs_f64(
+    let interval = std::time::Duration::from_secs_f64(
         device.vi.frame_time * device.ui.speed_limiter.limit_freq as f64,
     );
-
-    if let Some(netplay) = &device.netplay {
-        let ahead = netplay.session.frames_ahead();
-        if ahead > 0 {
-            interval = interval.mul_f64(1.0 + 0.05 * ahead.min(2) as f64);
-        } else if ahead < 0 {
-            interval = interval.mul_f64(1.0 - 0.05 * (-ahead).min(2) as f64);
-        }
-    }
 
     let now = std::time::Instant::now();
     match device.ui.speed_limiter.next_pace_deadline {

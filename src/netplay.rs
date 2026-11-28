@@ -134,6 +134,7 @@ pub struct Netplay {
     pub inputs: Vec<ui::input::InputData>,
     pub requests: std::collections::VecDeque<ggrs::GgrsRequest<GgrsConfig>>,
     frame_progress: FrameProgress,
+    pacing: FramePacing,
     pub incoming_message: Vec<u8>,
     pub ice_config_path: std::path::PathBuf,
     /// Diagnostic: see `SYNC_LOG_VARIABLE`.
@@ -223,6 +224,29 @@ fn write_sync_log(log: &mut std::fs::File, frame: i32, memory: &[u8]) {
 }
 
 impl Netplay {
+    pub fn pace_frame(&mut self, frame_time: f64) {
+        let ahead = if self.disconnected {
+            0
+        } else {
+            self.session.frames_ahead()
+        };
+        self.pacing.adjust(ahead);
+        let interval =
+            std::time::Duration::from_secs_f64(frame_time * (1.0 + self.pacing.extra_period));
+        let now = std::time::Instant::now();
+        let deadline = self.pacing.deadline.unwrap_or(now);
+        if deadline > now {
+            spin_sleep::sleep(deadline - now);
+        }
+        // Preserve phase across ordinary jitter. After a long replay allow one
+        // immediate frame, without banking a burst of overdue presentations.
+        self.pacing.deadline = Some((deadline + interval).max(std::time::Instant::now()));
+    }
+
+    pub fn audio_rate(&self) -> f64 {
+        (1.0 + self.pacing.extra_period).recip()
+    }
+
     /// The client playing as player 1 hosts the session: it provides the saves,
     /// the RNG seed and the RTC timestamp.
     pub fn is_host(&self) -> bool {
@@ -235,10 +259,37 @@ impl Netplay {
     }
 }
 
+/// Wall-clock state stays with the session across rollback loads.
+#[derive(Default)]
+struct FramePacing {
+    deadline: Option<std::time::Instant>,
+    wait_frames: f64,
+    extra_period: f64,
+}
+
+impl FramePacing {
+    fn recommend_wait(&mut self, frames: u32) {
+        // Each recommendation is a new estimate of the same lead.
+        self.wait_frames = f64::from(frames);
+    }
+
+    fn adjust(&mut self, ahead: i32) {
+        if ahead <= 0 {
+            self.wait_frames = 0.0;
+        }
+        // Trim smaller leads before GGRS reaches its three-frame threshold.
+        // Spread a recommended wait over at least 25 VIs per frame of lead.
+        let trim = f64::from(ahead.clamp(0, 2)) / 60.0;
+        let target = trim.max(self.wait_frames.min(0.04));
+        self.extra_period += (target - self.extra_period).clamp(-0.002, 0.002);
+        self.wait_frames = (self.wait_frames - self.extra_period).max(0.0);
+    }
+}
+
 #[derive(Default)]
 struct FrameProgress {
     next_frame: i32,
-    next_audio_frame: i32,
+    next_live_frame: i32,
     replaying: bool,
 }
 
@@ -248,11 +299,10 @@ impl FrameProgress {
     }
 
     fn advance(&mut self) {
-        // Audio already submitted to SDL survives a rollback. Only extend its
-        // timeline when we simulate a frame beyond the previous frontier.
-        self.replaying = self.next_frame < self.next_audio_frame;
+        // Count each frame once for presentation, audio and wall-clock pacing.
+        self.replaying = self.next_frame < self.next_live_frame;
         self.next_frame += 1;
-        self.next_audio_frame = self.next_audio_frame.max(self.next_frame);
+        self.next_live_frame = self.next_live_frame.max(self.next_frame);
     }
 }
 
@@ -639,17 +689,7 @@ fn check_disconnect(netplay: &mut Netplay) {
 }
 
 pub fn in_rollback(netplay: Option<&Netplay>) -> bool {
-    netplay.is_some_and(|netplay| {
-        netplay
-            .requests
-            .iter()
-            .any(|r| matches!(r, ggrs::GgrsRequest::AdvanceFrame { .. }))
-    })
-}
-
-pub fn replaying_audio(netplay: Option<&Netplay>) -> bool {
-    // A replay-only batch can end while prediction is still blocked. Even its
-    // final frame must not resubmit audio, regardless of the pending requests.
+    // Even the last frame of a replay-only batch has already been presented.
     netplay.is_some_and(|netplay| netplay.frame_progress.replaying)
 }
 
@@ -713,6 +753,7 @@ fn poll_clients(netplay: &mut Netplay) {
                 println!("network resumed");
             }
             ggrs::GgrsEvent::WaitRecommendation { skip_frames } => {
+                netplay.pacing.recommend_wait(skip_frames);
                 println!("wait recommendation: skip_frames={}", skip_frames);
             }
             ggrs::GgrsEvent::DesyncDetected { .. } => {
@@ -1062,6 +1103,7 @@ pub fn init(
         inputs: vec![ui::input::InputData::default(); number_of_players],
         requests: std::collections::VecDeque::new(),
         frame_progress: FrameProgress::default(),
+        pacing: FramePacing::default(),
         received_data: std::collections::VecDeque::new(),
         messages: std::collections::HashMap::new(),
         ice_config_path: netplay_config.ice_config_path.clone(),
@@ -1095,6 +1137,46 @@ pub fn close(netplay: &mut Netplay) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wait_recommendations_slew_and_expire() {
+        let mut pacing = FramePacing::default();
+        pacing.recommend_wait(3);
+        for _ in 0..30 {
+            let previous = pacing.extra_period;
+            pacing.adjust(3);
+            assert!(pacing.extra_period > 0.0 && pacing.extra_period <= 0.04);
+            assert!(pacing.extra_period - previous <= 0.002 + f64::EPSILON);
+        }
+        assert!((0.0..3.0).contains(&pacing.wait_frames));
+        pacing.recommend_wait(3);
+        assert_eq!(pacing.wait_frames, 3.0);
+        for _ in 0..100 {
+            pacing.adjust(3);
+        }
+        assert_eq!(pacing.wait_frames, 0.0);
+
+        pacing.recommend_wait(5);
+        for _ in 0..20 {
+            pacing.adjust(-1);
+        }
+        assert_eq!(pacing.wait_frames, 0.0);
+        assert_eq!(pacing.extra_period, 0.0);
+    }
+
+    #[test]
+    fn only_new_frames_are_paced_after_rollback() {
+        let mut progress = FrameProgress::default();
+        progress.advance();
+        progress.advance();
+        progress.load(0);
+        for _ in 0..2 {
+            progress.advance();
+            assert!(progress.replaying);
+        }
+        progress.advance();
+        assert!(!progress.replaying);
+    }
 
     fn join(count: usize, game: &str) -> Vec<u8> {
         encode_auto_join(count, game)
