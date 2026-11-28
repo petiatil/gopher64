@@ -5,6 +5,7 @@ use crate::ui;
 const BYTES_PER_FRAME: usize = 4; // Stereo, signed 16-bit samples.
 const TARGET_FRAMES: f64 = 2.0;
 const MAX_FRAMES: f64 = 12.0;
+const MAX_GAIN: f32 = 2.0;
 
 pub fn init(device: &mut device::Device) {
     ui::sdl_init(sdl3_sys::init::SDL_INIT_AUDIO);
@@ -66,6 +67,7 @@ pub fn init_game_audio(device: &mut device::Device) {
     if device.ui.audio.audio_stream.is_null() {
         panic!("Could not create audio stream");
     }
+    device.ui.audio.gain = device.ui.config.audio.volume.clamp(0.0, MAX_GAIN);
     if !unsafe {
         sdl3_sys::audio::SDL_SetAudioStreamGain(device.ui.audio.audio_stream, device.ui.audio.gain)
     } {
@@ -97,6 +99,8 @@ pub fn lower_audio_volume(ui: &mut ui::Ui) {
         }
         sdl3_sys::audio::SDL_SetAudioStreamGain(ui.audio.audio_stream, ui.audio.gain);
     }
+    // kept for the next session
+    ui.config.audio.volume = ui.audio.gain;
     ui::video::onscreen_message(
         &format!("Audio volume: {:.0}%", ui.audio.gain * 100.0),
         ui::video::MESSAGE_LENGTH_MESSAGE_VERY_SHORT,
@@ -106,11 +110,13 @@ pub fn lower_audio_volume(ui: &mut ui::Ui) {
 pub fn raise_audio_volume(ui: &mut ui::Ui) {
     unsafe {
         ui.audio.gain = sdl3_sys::audio::SDL_GetAudioStreamGain(ui.audio.audio_stream) + 0.05;
-        if ui.audio.gain > 2.0 {
-            ui.audio.gain = 2.0;
+        if ui.audio.gain > MAX_GAIN {
+            ui.audio.gain = MAX_GAIN;
         }
         sdl3_sys::audio::SDL_SetAudioStreamGain(ui.audio.audio_stream, ui.audio.gain);
     }
+    // kept for the next session
+    ui.config.audio.volume = ui.audio.gain;
     ui::video::onscreen_message(
         &format!("Audio volume: {:.0}%", ui.audio.gain * 100.0),
         ui::video::MESSAGE_LENGTH_MESSAGE_VERY_SHORT,

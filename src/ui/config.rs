@@ -91,12 +91,31 @@ pub struct DirectNetplay {
     pub total_players: usize,
 }
 
+/// The volume a game starts at when none has been chosen yet.
+pub const DEFAULT_AUDIO_VOLUME: f32 = 0.5;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct Audio {
+    /// 1.0 is the game's own level. Changed in game with the [ and ] keys.
+    pub volume: f32,
+}
+
+impl Default for Audio {
+    fn default() -> Self {
+        Audio {
+            volume: DEFAULT_AUDIO_VOLUME,
+        }
+    }
+}
+
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 pub struct Config {
     pub input: Input,
     pub video: Video,
     pub emulation: Emulation,
     pub ui: Ui,
+    #[serde(default)]
+    pub audio: Audio,
     #[serde(skip)]
     write_to_disk: bool,
 }
@@ -216,6 +235,7 @@ impl Config {
                 recent_roms: Vec::new(),
                 direct_netplay: DirectNetplay::default(),
             },
+            audio: Audio::default(),
             write_to_disk: true,
         }
     }
