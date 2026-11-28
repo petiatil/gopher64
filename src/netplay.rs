@@ -22,12 +22,58 @@ impl ggrs::Config for GgrsConfig {
 
 pub struct MatchboxChannel {
     channel: matchbox_socket::WebRtcChannel,
+    delayed: Option<TestPacketDelay>,
+}
+
+/// Loopback diagnostic. Set the one-way delay on each client to half the desired RTT.
+/// Keep packets in send order and leave the emulation thread free to poll and play.
+struct TestPacketDelay {
+    delay: std::time::Duration,
+    tx: tokio::sync::mpsc::UnboundedSender<(
+        tokio::time::Instant,
+        matchbox_socket::PeerId,
+        matchbox_socket::Packet,
+    )>,
+}
+
+impl TestPacketDelay {
+    fn from_env(channel: &matchbox_socket::WebRtcChannel) -> Option<Self> {
+        let ms: u64 = std::env::var("GOPHER64_NETPLAY_TEST_DELAY_MS")
+            .ok()?
+            .parse()
+            .ok()?;
+        if ms == 0 {
+            return None;
+        }
+        let sender = channel.sender_clone();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Some((deadline, peer, packet)) = rx.recv().await {
+                tokio::time::sleep_until(deadline).await;
+                if sender.unbounded_send((peer, packet)).is_err() {
+                    break;
+                }
+            }
+        });
+        Some(Self {
+            delay: std::time::Duration::from_millis(ms),
+            tx,
+        })
+    }
 }
 
 impl ggrs::NonBlockingSocket<matchbox_socket::PeerId> for MatchboxChannel {
     fn send_to(&mut self, msg: &ggrs::Message, addr: &matchbox_socket::PeerId) {
         let encoded = postcard::to_stdvec(msg).expect("serialization failed");
-        let _ = self.channel.try_send(encoded.into(), *addr);
+        if let Some(delayed) = &self.delayed {
+            let _ = delayed.tx.send((
+                tokio::time::Instant::now() + delayed.delay,
+                *addr,
+                encoded.into(),
+            ));
+        } else {
+            let _ = self.channel.try_send(encoded.into(), *addr);
+        }
     }
 
     fn receive_all_messages(&mut self) -> Vec<(matchbox_socket::PeerId, ggrs::Message)> {
@@ -972,8 +1018,10 @@ pub fn init(
         }
     }
 
+    let channel = socket.take_channel(0).unwrap();
     let matchbox_channel = MatchboxChannel {
-        channel: socket.take_channel(0).unwrap(),
+        delayed: TestPacketDelay::from_env(&channel),
+        channel,
     };
     let reliable_channel = socket.take_channel(1).unwrap();
 
