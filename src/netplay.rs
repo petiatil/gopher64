@@ -1031,7 +1031,10 @@ pub fn init(
         .with_num_players(number_of_players)
         .unwrap()
         .with_input_delay(netplay_config.input_delay)
-        .with_sparse_saving_mode(true)
+        // Sparse GGRS checkpoints can require replaying the entire window
+        // just to save a confirmed frame. Save each VI to bound replay work
+        // to the frames affected by a late input.
+        .with_sparse_saving_mode(false)
         .with_fps(if pal { 50 } else { 60 })
         .unwrap()
         .with_desync_detection_mode(ggrs::DesyncDetection::On { interval: 60 })

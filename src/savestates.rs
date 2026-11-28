@@ -1,4 +1,4 @@
-use crate::{cheats, device, retroachievements, ui};
+use crate::{cheats, device, netplay, retroachievements, ui};
 #[cfg(target_arch = "aarch64")]
 use device::__m128i;
 use serde::de::{Deserialize, Deserializer, SeqAccess, Visitor};
@@ -151,10 +151,16 @@ pub fn create_savestate(device: &mut device::Device, rewind: bool, rewind_frame:
         rewind_frame.unwrap_or_else(|| pool.keys().last().map_or(0, |key| key + 1))
     });
     let mut state = if let Some(key) = rewind_key {
+        // GGRS can restore the oldest predicted frame as well as the current one.
+        let capacity = if rewind_frame.is_some() {
+            netplay::MAX_PREDICTION_WINDOW + 1
+        } else {
+            REWIND_POOL_SIZE
+        };
         let pool = &mut device.ui.savestate.rewind_pool;
         pool.remove(&key)
             .or_else(|| {
-                if pool.len() >= REWIND_POOL_SIZE {
+                if pool.len() >= capacity {
                     pool.pop_first().map(|(_, state)| state)
                 } else {
                     None
