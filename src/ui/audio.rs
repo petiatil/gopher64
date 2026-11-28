@@ -12,11 +12,18 @@ pub fn init(device: &mut device::Device) {
     init_game_audio(device);
 }
 
-// Correct clock drift before it causes starvation or excessive latency. Slew at most 0.05% per second of submitted audio.
-fn frequency_ratio(current: f64, queued_frames: f64, seconds: f64) -> f64 {
-    let target = (1.0 + (queued_frames - TARGET_FRAMES) * 0.001).clamp(0.995, 1.005);
-    let step = seconds * 0.0005;
-    (current + (target - current).clamp(-step, step)).clamp(0.995, 1.005)
+// Netplay can also run late while replaying. Steer the reserve back toward
+// two VIs before reaching the stream-clear threshold. Bound the pitch slew
+// per second of audio so individual DMA blocks cannot cause abrupt changes.
+fn frequency_ratio(current: f64, queued_frames: f64, seconds: f64, netplay: bool) -> f64 {
+    let (gain, range, slew) = if netplay {
+        (0.008, 0.04, 0.01)
+    } else {
+        (0.001, 0.005, 0.0005)
+    };
+    let target = 1.0 + ((queued_frames - TARGET_FRAMES) * gain).clamp(-range, range);
+    let step = seconds * slew;
+    current + (target - current).clamp(-step, step)
 }
 
 pub fn update_freq(device: &mut device::Device) {
@@ -152,10 +159,7 @@ pub fn play_audio(device: &mut device::Device, dram_addr: usize, length: u64) {
         device.ai.freq,
         device.vi.frame_time,
         device.ui.speed_limiter.enabled,
-        device
-            .netplay
-            .as_ref()
-            .map_or(1.0, netplay::Netplay::audio_rate),
+        device.netplay.as_ref().map(netplay::Netplay::audio_rate),
     );
 }
 
@@ -164,7 +168,7 @@ fn queue_audio(
     frequency: u64,
     frame_time: f64,
     speed_limited: bool,
-    playback_rate: f64,
+    netplay_rate: Option<f64>,
 ) {
     let bytes_per_second = frequency as f64 * BYTES_PER_FRAME as f64;
     let bytes_per_video_frame = bytes_per_second * frame_time;
@@ -229,6 +233,7 @@ fn queue_audio(
                         queued_frames
                     },
                     seconds,
+                    netplay_rate.is_some(),
                 )
             } else {
                 1.0
@@ -238,7 +243,7 @@ fn queue_audio(
             // residual device clock drift around that playback rate.
             sdl3_sys::audio::SDL_SetAudioStreamFrequencyRatio(
                 stream,
-                (playback_rate * ratio) as f32,
+                (netplay_rate.unwrap_or(1.0) * ratio) as f32,
             );
             sdl3_sys::audio::SDL_PutAudioStreamData(
                 stream,
@@ -247,5 +252,25 @@ fn queue_audio(
             );
         }
         sdl3_sys::audio::SDL_UnlockAudioStream(stream);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_sustained_netplay_queue_error_recovers_before_the_stream_clears() {
+        let mut queued = TARGET_FRAMES;
+        let mut ratio = 1.0;
+        for _ in 0..3600 {
+            let previous = ratio;
+            ratio = frequency_ratio(previous, queued, 1.0 / 60.0, true);
+            assert!((ratio - previous).abs() <= 0.01 / 60.0 + f64::EPSILON);
+            // One VI arrives while the output clock consumes 3% less audio.
+            queued += 1.0 - 0.97 * ratio;
+            assert!(queued < MAX_FRAMES);
+        }
+        assert!((0.97 * ratio - 1.0).abs() < 0.001);
     }
 }
